@@ -90,10 +90,29 @@ If you see warnings about `torch.classes` when running Streamlit, this is a know
 
 The app will function normally despite these warnings.
 
+## OCR Support
+
+The ingestion pipeline includes intelligent OCR fallback:
+- **Primary**: Uses `pdfplumber` for text extraction
+- **Fallback**: Automatically uses `pytesseract` OCR when:
+  - Text extraction returns empty text
+  - Extracted text is too short (< 30 characters)
+- **Requirements**: 
+  - **Tesseract OCR** must be installed on your system:
+    - Windows: Download from [GitHub](https://github.com/UB-Mannheim/tesseract/wiki)
+    - Linux: `sudo apt-get install tesseract-ocr`
+    - macOS: `brew install tesseract`
+  - **Poppler** (for pdf2image):
+    - Windows: Download from [poppler-windows](https://github.com/oschwartz10612/poppler-windows/releases/) and add to PATH
+    - Linux: `sudo apt-get install poppler-utils`
+    - macOS: `brew install poppler`
+- OCR is only used when needed, keeping processing fast for text-based pages
+
 ## Notes
 
 - The system uses extraction-based answer generation (no LLM required)
 - All answers are grounded in the handbook with page citations
 - Similarity threshold filters out irrelevant queries
 - The index is persisted to disk for fast subsequent queries
+- OCR fallback ensures complete text extraction from scanned pages and images
 

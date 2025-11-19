@@ -1,11 +1,11 @@
 """
 FYP Handbook RAG Pipeline - Ingestion Script
 Loads PDF, chunks text, creates embeddings, and builds FAISS index.
+Includes OCR fallback for pages with scanned images or incomplete text extraction.
 """
 
 import os
 import json
-import pickle
 from typing import List, Dict, Tuple
 import re
 
@@ -14,11 +14,122 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 import faiss
 
+# OCR dependencies (optional - only used as fallback)
+PDF2IMAGE_AVAILABLE = False
+PYTESSERACT_AVAILABLE = False
+
+# Manual path configuration (set these if auto-detection fails)
+# Uncomment and set the paths to your installation locations:
+TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+POPPLER_PATH = r"C:\poppler\poppler-25.11.0\Library\bin"
+
+try:
+    from pdf2image import convert_from_path
+    PDF2IMAGE_AVAILABLE = True
+except ImportError:
+    pass  # Will be handled gracefully
+
+try:
+    import pytesseract
+    PYTESSERACT_AVAILABLE = True
+except ImportError:
+    pass  # Will be handled gracefully
+
+
+def configure_tesseract_path():
+    """Configure Tesseract path, especially for Windows installations."""
+    import platform
+    
+    if not PYTESSERACT_AVAILABLE:
+        return False
+    
+    # Check if manual path is set
+    if 'TESSERACT_PATH' in globals() and TESSERACT_PATH:
+        if os.path.exists(TESSERACT_PATH):
+            pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+            try:
+                pytesseract.get_tesseract_version()
+                print(f"Using manually configured Tesseract at: {TESSERACT_PATH}")
+                return True
+            except Exception:
+                pass
+    
+    # Try to get Tesseract version (this will fail if not in PATH)
+    try:
+        pytesseract.get_tesseract_version()
+        return True
+    except Exception:
+        # Tesseract not in PATH, try common Windows installation paths
+        if platform.system() == 'Windows':
+            common_paths = [
+                r'C:\Program Files\Tesseract-OCR\tesseract.exe',
+                r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
+                r'C:\Users\{}\AppData\Local\Programs\Tesseract-OCR\tesseract.exe'.format(os.getenv('USERNAME', '')),
+            ]
+            
+            for path in common_paths:
+                if os.path.exists(path):
+                    pytesseract.pytesseract.tesseract_cmd = path
+                    try:
+                        pytesseract.get_tesseract_version()
+                        print(f"Found Tesseract at: {path}")
+                        return True
+                    except Exception:
+                        continue
+        
+        return False
+
+
+def configure_poppler_path():
+    """Configure Poppler path, especially for Windows installations."""
+    import platform
+    import shutil
+    
+    if not PDF2IMAGE_AVAILABLE:
+        return False
+    
+    # Check if manual path is set
+    if 'POPPLER_PATH' in globals() and POPPLER_PATH:
+        if os.path.exists(POPPLER_PATH):
+            poppler_exe = os.path.join(POPPLER_PATH, 'pdftoppm.exe')
+            if os.path.exists(poppler_exe):
+                os.environ['PATH'] = POPPLER_PATH + os.pathsep + os.environ.get('PATH', '')
+                print(f"Using manually configured Poppler at: {POPPLER_PATH}")
+                return True
+    
+    # Check if poppler is already in PATH
+    if shutil.which('pdftoppm') or shutil.which('pdftocairo'):
+        return True
+    
+    if platform.system() == 'Windows':
+        # Common Poppler installation paths on Windows
+        common_paths = [
+            r'C:\poppler\poppler-25.11.0\Library\bin',
+            r'C:\poppler\poppler-25.11.0\Library\bin',
+            r'C:\poppler\poppler-25.11.0\Library\bin',
+            r'C:\poppler\poppler-25.11.0\Library\bin'.format(os.getenv('USERNAME', '')),
+        ]
+        
+        # Try to find poppler in common locations
+        for path in common_paths:
+            if os.path.exists(path):
+                poppler_exe = os.path.join(path, 'pdftoppm.exe')
+                if os.path.exists(poppler_exe):
+                    # Set environment variable for pdf2image
+                    os.environ['PATH'] = path + os.pathsep + os.environ.get('PATH', '')
+                    print(f"Found Poppler at: {path}")
+                    return True
+        
+        return False
+    
+    return True  # On Linux/Mac, assume it's in PATH
+
 # Configuration
 CHUNK_SIZE = 300  # Target words per chunk (250-400 range)
 CHUNK_OVERLAP = 0.3  # 30% overlap (20-40% range)
 SIMILARITY_THRESHOLD = 0.25
 TOP_K = 5
+OCR_MIN_TEXT_LENGTH = 30  # Minimum characters to consider text extraction successful
 
 # Paths
 PDF_PATH = "FYP-Handbook-2023.pdf"
@@ -30,20 +141,134 @@ os.makedirs(INDEX_DIR, exist_ok=True)
 os.makedirs(EMBEDDINGS_DIR, exist_ok=True)
 
 
-def extract_text_with_pages(pdf_path: str) -> List[Tuple[int, str]]:
+def clean_ocr_text(text: str) -> str:
+    """
+    Clean OCR text by removing common OCR artifacts and normalizing whitespace.
+    """
+    if not text:
+        return ""
+    
+    # Remove excessive whitespace
+    text = re.sub(r'\s+', ' ', text)
+    
+    # Fix common OCR errors (optional - can be expanded)
+    # Remove isolated characters that are likely OCR errors
+    text = re.sub(r'\s+[a-z]\s+', ' ', text)
+    
+    # Normalize quotes and dashes
+    text = text.replace('"', '"').replace('"', '"')
+    text = text.replace(''', "'").replace(''', "'")
+    text = text.replace('—', '-').replace('–', '-')
+    
+    # Remove page numbers and headers/footers if they appear
+    # (This is heuristic and may need adjustment)
+    lines = text.split('\n')
+    cleaned_lines = []
+    for line in lines:
+        line = line.strip()
+        # Skip lines that are just numbers (likely page numbers)
+        if line.isdigit() and len(line) < 4:
+            continue
+        # Skip very short lines that are likely artifacts
+        if len(line) < 3:
+            continue
+        cleaned_lines.append(line)
+    
+    text = ' '.join(cleaned_lines)
+    
+    # Final cleanup
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    return text
+
+
+def extract_text_with_ocr_fallback(pdf_path: str, page_num: int, ocr_enabled: bool = True) -> str:
+    """
+    Extract text from a single PDF page using OCR as fallback.
+    Returns extracted text (from pdfplumber or OCR).
+    """
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            if page_num > len(pdf.pages):
+                return ""
+            
+            page = pdf.pages[page_num - 1]  # pdfplumber uses 0-based indexing
+            text = page.extract_text()
+            
+            # Clean up text
+            if text:
+                text = re.sub(r'\s+', ' ', text).strip()
+            
+            # Check if text extraction was successful
+            # If text is empty or too short, use OCR (if available and enabled)
+            if (not text or len(text) < OCR_MIN_TEXT_LENGTH) and ocr_enabled and PDF2IMAGE_AVAILABLE and PYTESSERACT_AVAILABLE:
+                print(f"  Page {page_num}: Text extraction insufficient ({len(text) if text else 0} chars), using OCR...")
+                
+                # Convert PDF page to image
+                try:
+                    images = convert_from_path(
+                        pdf_path,
+                        first_page=page_num,
+                        last_page=page_num,
+                        dpi=300  # Higher DPI for better OCR accuracy
+                    )
+                    
+                    if images:
+                        # Run OCR on the image
+                        ocr_text = pytesseract.image_to_string(images[0], lang='eng')
+                        ocr_text = clean_ocr_text(ocr_text)
+                        
+                        if ocr_text and len(ocr_text) >= OCR_MIN_TEXT_LENGTH:
+                            print(f"  Page {page_num}: OCR successful ({len(ocr_text)} chars)")
+                            return ocr_text
+                        else:
+                            print(f"  Page {page_num}: OCR returned insufficient text ({len(ocr_text) if ocr_text else 0} chars)")
+                            return text if text else ""  # Return original text or empty
+                    else:
+                        print(f"  Page {page_num}: Failed to convert page to image")
+                        return text if text else ""
+                        
+                except Exception as ocr_error:
+                    print(f"  Page {page_num}: OCR failed: {ocr_error}")
+                    return text if text else ""  # Fallback to original text
+            elif not text or len(text) < OCR_MIN_TEXT_LENGTH:
+                # OCR not available, but text is insufficient
+                print(f"  Page {page_num}: Text extraction insufficient ({len(text) if text else 0} chars), OCR not available")
+                return text if text else ""
+            
+            return text
+            
+    except Exception as e:
+        print(f"  Page {page_num}: Error extracting text: {e}")
+        return ""
+
+
+def extract_text_with_pages(pdf_path: str, ocr_enabled: bool = True) -> List[Tuple[int, str]]:
     """
     Extract text from PDF preserving page numbers.
+    Uses OCR as fallback when text extraction fails or returns insufficient text.
     Returns list of (page_number, text) tuples.
     """
     pages_data = []
     
-    with pdfplumber.open(pdf_path) as pdf:
-        for page_num, page in enumerate(pdf.pages, start=1):
-            text = page.extract_text()
-            if text:
-                # Clean up text
-                text = re.sub(r'\s+', ' ', text).strip()
-                pages_data.append((page_num, text))
+    print(f"Extracting text from PDF: {pdf_path}")
+    
+    # First, get total number of pages
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            total_pages = len(pdf.pages)
+            print(f"Total pages: {total_pages}")
+    except Exception as e:
+        print(f"Error opening PDF: {e}")
+        return pages_data
+    
+    # Extract text from each page
+    for page_num in range(1, total_pages + 1):
+        text = extract_text_with_ocr_fallback(pdf_path, page_num, ocr_enabled)
+        if text:  # Only add pages with text
+            pages_data.append((page_num, text))
+        else:
+            print(f"  Page {page_num}: No text extracted (skipping)")
     
     return pages_data
 
@@ -102,13 +327,13 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: float = CHUNK_O
     return chunks
 
 
-def process_pdf(pdf_path: str) -> List[Dict]:
+def process_pdf(pdf_path: str, ocr_enabled: bool = True) -> List[Dict]:
     """
     Process PDF: extract text, chunk, and create metadata.
     Returns list of chunk dictionaries with metadata.
     """
     print(f"Loading PDF: {pdf_path}")
-    pages_data = extract_text_with_pages(pdf_path)
+    pages_data = extract_text_with_pages(pdf_path, ocr_enabled)
     print(f"Extracted {len(pages_data)} pages")
     
     all_chunks = []
@@ -202,8 +427,45 @@ def main():
         print(f"Error: PDF file not found at {PDF_PATH}")
         return
     
+    # Check and configure OCR dependencies
+    tesseract_configured = False
+    poppler_configured = False
+    ocr_enabled = False
+    
+    if PYTESSERACT_AVAILABLE:
+        tesseract_configured = configure_tesseract_path()
+        if not tesseract_configured:
+            print("Warning: Tesseract OCR not found in PATH or common installation locations.")
+            print("  Please ensure Tesseract is installed and either:")
+            print("  1. Add it to your system PATH, or")
+            print("  2. Set pytesseract.pytesseract.tesseract_cmd in the script")
+    
+    if PDF2IMAGE_AVAILABLE:
+        poppler_configured = configure_poppler_path()
+        if not poppler_configured:
+            print("Warning: Poppler not found in PATH or common installation locations.")
+            print("  Please ensure Poppler is installed and either:")
+            print("  1. Add it to your system PATH, or")
+            print("  2. Set the PATH environment variable to include Poppler's bin directory")
+    
+    ocr_enabled = (PDF2IMAGE_AVAILABLE and PYTESSERACT_AVAILABLE and 
+                   tesseract_configured and poppler_configured)
+    
+    if ocr_enabled:
+        print("OCR support: Available and configured (pytesseract + pdf2image)")
+    elif PDF2IMAGE_AVAILABLE and PYTESSERACT_AVAILABLE:
+        print("OCR support: Dependencies installed but configuration incomplete")
+        print("Continuing with text extraction only (OCR will be skipped)...")
+    else:
+        print("OCR support: Not available (missing dependencies)")
+        print("Continuing with text extraction only...")
+    
     # Step 1: Load and chunk PDF
-    chunks = process_pdf(PDF_PATH)
+    chunks = process_pdf(PDF_PATH, ocr_enabled)
+    
+    if not chunks:
+        print("Error: No chunks created. Please check the PDF file.")
+        return
     
     # Step 2: Create embeddings and FAISS index
     index, model = create_embeddings_and_index(chunks)
@@ -221,4 +483,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

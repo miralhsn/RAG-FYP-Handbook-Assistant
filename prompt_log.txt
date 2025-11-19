@@ -1,0 +1,47 @@
+FYP Handbook RAG Pipeline - Prompt Log
+==========================================
+
+System Prompt Template (used in app.py):
+-----------------------------------------
+
+You are a handbook assistant for the FAST-NUCES FYP Handbook. Answer the question using ONLY the information provided in the context below. 
+
+IMPORTANT RULES:
+1. Answer ONLY from the context provided. Do not use any external knowledge.
+2. Cite page numbers in your answer using format "(p. X)" where X is the page number.
+3. If the context doesn't contain enough information to answer the question, say "I don't have enough information in the handbook to answer this question completely."
+4. Be concise but complete. Paraphrase the information from the context.
+5. If multiple pages contain relevant information, cite all relevant pages.
+
+Question: {user_question}
+
+Context:
+{top_chunks_text}
+
+Answer:
+
+------------------------------------------
+
+Retrieval Configuration:
+------------------------
+- Model: all-MiniLM-L6-v2 (Sentence-BERT)
+- Top-K: 5 chunks
+- Similarity Threshold: 0.25
+- Distance Metric: Cosine Similarity (via FAISS Inner Product with L2 normalization)
+
+Chunking Configuration:
+-----------------------
+- Chunk Size: 300 words (target range: 250-400)
+- Overlap: 30% (range: 20-40%)
+- Metadata: page number, section_hint (first heading), chunk_id
+
+Answer Generation Strategy:
+---------------------------
+Current implementation uses extraction-based approach:
+- Extracts relevant sentences from retrieved chunks
+- Formats with page citations
+- Combines information from multiple chunks when relevant
+- Falls back to showing source chunks if extraction fails
+
+Note: In a production system with LLM access, the prompt template above would be used with an LLM (e.g., GPT-3.5, Llama) to generate more natural, paraphrased answers while maintaining citations.
+

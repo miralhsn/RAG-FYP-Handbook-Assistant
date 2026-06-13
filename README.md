@@ -31,16 +31,6 @@ Instead of manually searching through PDFs, users can ask questions and get:
 
 ---
 
-## 🚀 Live Demo
-
-<p align="center">
-  <img src="assets/demo.gif" width="800"/>
-</p>
-
-> Replace this with a screen recording of your Streamlit app
-
----
-
 ## ⚙️ System Architecture
 
 PDF → Chunking → Sentence-BERT Embeddings → FAISS Index → Semantic Retrieval → Answer Output
